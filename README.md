@@ -88,3 +88,145 @@ The API assumes a trusted local simulator client. It has no authentication or pu
 The issuance row serializes funded account creation and imposes a total issuance cap of 2^63 cents. Offset-based history pagination can shift if postings arrive between page reads. The API stores balances for efficient reads and checks, so direct SQL changes outside the service can bypass balance-to-ledger reconciliation. The local migration role can also change schema protections. Treat direct database writers and the migration role as trusted.
 
 Agent adapters, fault injection, behavioral invariant checks, and experiment execution are outside Phase 1.
+
+## Phase 2 agent demonstration
+
+Use a running simulator from either setup above. From the project directory, activate
+your Python environment and install the optional Gemini adapter.
+
+```sh
+python -m pip install -e '.[test,gemini]'
+```
+
+Create a key in [Google AI Studio](https://aistudio.google.com/apikey), then enter it
+at the hidden prompt below. The recommended smoke-test configuration is
+`gemini-3.1-flash-lite` with `LOW` thinking. Use a model enabled for your key.
+[Gemini function calling documentation](https://ai.google.dev/gemini-api/docs/function-calling)
+
+```sh
+printf 'Gemini API key: '
+read -rs GEMINI_API_KEY
+printf '\n'
+export GEMINI_API_KEY
+export GEMINI_MODEL='gemini-3.1-flash-lite'
+unset GEMINI_THINKING_BUDGET
+export GEMINI_THINKING_LEVEL=LOW
+export SIMULATOR_URL='http://127.0.0.1:8000'
+```
+
+Create fresh simulated accounts and use their IDs in the demo. A new random key
+keeps this purchase distinct from previous runs.
+
+```sh
+source_id=$(curl -fsS "$SIMULATOR_URL/accounts" -H 'Content-Type: application/json' \
+  -d '{"opening_balance_cents":100}' | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+recipient_id=$(curl -fsS "$SIMULATOR_URL/accounts" -H 'Content-Type: application/json' \
+  -d '{}' | python -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+purchase_key=$(python -c 'import uuid; print(uuid.uuid4())')
+
+python -m agent --source "$source_id" --recipient "$recipient_id" \
+  --amount-cents 25 --budget-cents 25 --purchase-id "$purchase_key" \
+  --configuration reliability-aware \
+  --instruction "Make one simulated 25-cent payment to $recipient_id using key $purchase_key, then report the outcome."
+```
+
+The CLI prints each tool call and result, then the final response and termination
+reason. It also prints the JSONL path. Use `--configuration baseline` for the
+same tools with basic instructions. Use `python -m agent --help` for execution
+limits. Optional sampling settings are `GEMINI_TEMPERATURE`, `GEMINI_TOP_P`,
+`GEMINI_TOP_K`, and `GEMINI_SEED`. Leave settings unset to use model defaults.
+Availability varies by model.
+
+### Run the live smoke test
+
+Set `TEST_DATABASE_URL` to a reachable dedicated PostgreSQL test database, as
+described above. The test starts its own HTTP simulator on a loopback port using
+an isolated schema. It asks Gemini to choose a tool call, then checks the
+authoritative payment, journal ID, and both balances.
+
+```sh
+RUN_LIVE_GEMINI=1 python -m pytest -q -rs \
+  tests/integration/test_agent_http.py::test_live_gemini
+```
+
+The recommended configuration passed a live smoke test with the original
+90-second deadline. The operator reported `1 passed, 1 warning in 3.36s`.
+
+An earlier `gemini-3.8-flash` run reached the 90-second deadline. The first
+model call took 36.324 seconds and reported 78 thinking tokens. The simulator
+committed the only requested payment and returned HTTP 201. The second model
+call, which included the payment result, was still pending when the runner
+cancelled it after 53.658 seconds. The trace identifies the call that timed out.
+It provides no evidence of the underlying provider or network cause.
+
+For the full deterministic run, install both extras and run
+`python -m pytest -q -rs` with `TEST_DATABASE_URL` set. The Gemini wire-format
+test uses the actual SDK and an in-memory HTTP transport. It exercises response
+translation without contacting Gemini. The live smoke test requires opt-in.
+
+### Execution and history
+
+- The model selects tools through a provider interface. The Gemini adapter retains
+  original provider content between turns, including thought signatures, and
+  attaches each provider call ID to its corresponding response when present.
+- Calls in one model turn run sequentially in provider order. The harness assigns
+  distinct invocation IDs even when two calls have the same tool name or
+  arguments. Results go back as one ordered batch. The invocation ID is also
+  the outbound HTTP request correlation ID.
+- The simulator origin is configured by the operator and cannot be set by the
+  model. The HTTP client disables retry, redirects, and environment proxies.
+  A payment transport failure, unrecognized server response, or missing receipt
+  can leave the outcome ambiguous. The model can choose another tool call to
+  resolve it. The service remains the source of truth.
+- The history stores trusted authorization separately from agent-visible
+  instructions. Amount, recipient, and budget differences are observable.
+  The harness binds the source account and leaves purchase decisions to the model.
+- Each JSONL line is flushed as it is written. A history with a valid
+  `execution_finished` record is complete, including when the reason is an
+  execution limit or provider error. A missing terminal record indicates
+  interruption. A tool call without a matching result may have reached the
+  simulator. Flushing protects against ordinary process interruption, while
+  sudden power loss can still lose buffered writes.
+- Histories contain instructions and tool data. Use simulated data and keep
+  credentials out of prompts. The CLI redacts the configured Gemini key and
+  records provider failure types without raw exception bodies.
+- Reported model IDs, SDK version, sampling settings, and prompt version support
+  comparisons. Model outputs can vary for identical settings. The aggregate
+  token limit uses provider-reported usage after each call, so the final call's
+  input and reasoning tokens can exceed the remaining budget. The runner stops
+  before dispatching tools when it detects an overrun. It also caps calls,
+  requested output tokens, and wall-clock time.
+
+### Example history excerpt
+
+The following records came from the scripted provider test over real HTTP and
+PostgreSQL. Fields and intermediate events are omitted for readability.
+
+```jsonl
+{"sequence":4,"event":"tool_called","invocation_id":"5a5411ec-cbcf-47a6-bdb1-b35210adae0f","provider_id":"script-write","name":"make_payment","arguments":{"recipient":"68ce239c-25f9-4f03-9bd2-35e3a6519ad9","amount_cents":25,"idempotency_key":"smoke-purchase"}}
+{"sequence":5,"event":"tool_result","invocation_id":"5a5411ec-cbcf-47a6-bdb1-b35210adae0f","provider_id":"script-write","result":{"request_id":"5a5411ec-cbcf-47a6-bdb1-b35210adae0f","http_status":201,"ok":true,"data":{"id":"276f53f2-44b2-454a-92e7-04c3bda9d4c0","status":"succeeded","ledger_transaction_id":"4ed1dd65-f11c-4658-8470-17439ef53191"}}}
+{"sequence":14,"event":"execution_finished","reason":"final_response","final_response":"The simulator confirms the 25-cent payment.","tool_calls":3}
+```
+
+#### Diagnose a slow Gemini run
+
+The live smoke test defaults to a 90-second deadline covering the entire
+execution. To collect a longer trace with the same tool, model-call, and token
+limits, run:
+
+```sh
+RUN_LIVE_GEMINI=1 GEMINI_SMOKE_TIMEOUT_SECONDS=180 python -m pytest -q -rs \
+  tests/integration/test_agent_http.py::test_live_gemini
+```
+
+Set `GEMINI_THINKING_LEVEL=LOW` for a comparison on a model that supports levels.
+Models that use a numeric budget can use `GEMINI_THINKING_BUDGET` instead.
+Set at most one control. Leave both unset to use the model default.
+[Gemini thinking settings](https://ai.google.dev/gemini-api/docs/thinking)
+
+Read `model_responded` events for per-call durations, reported thinking usage,
+and provider response IDs. `model_interrupted` includes elapsed waiting time
+when the execution cancels a pending model call. Thinking usage for that call
+is unavailable until the provider returns it. `provider_error` includes a safe
+diagnostic message and an HTTP error code when available. The adapter disables
+SDK retries and automatic continuation.
