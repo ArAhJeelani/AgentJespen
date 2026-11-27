@@ -91,11 +91,17 @@ def create_app(engine: Engine | None = None) -> FastAPI:
         return response
 
     @api.post("/accounts", status_code=201, response_model=AccountBalance)
-    def create_account(payload: AccountRequest, request: Request):
-        account, journal_id = payments.create_account(
-            request.app.state.engine, payload.opening_balance_cents, request.state.request_id
+    def create_account(payload: AccountRequest, request: Request, response: Response,
+                       idempotency_key: Annotated[str | None, Header(
+                           alias="Idempotency-Key", pattern=r"^[!-~]{1,128}$"
+                       )] = None):
+        account, journal_id, replay = payments.create_account(
+            request.app.state.engine, payload.opening_balance_cents, request.state.request_id, idempotency_key
         )
-        event("account_created", request, account_id=account["id"], ledger_transaction_id=journal_id)
+        if replay:
+            response.status_code = 200
+        event("account_replayed" if replay else "account_created", request,
+              account_id=account["id"], ledger_transaction_id=journal_id)
         return account
 
     @api.get("/accounts/{account_id}/balance", response_model=AccountBalance)

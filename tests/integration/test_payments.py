@@ -248,7 +248,8 @@ def test_commit_failure_rolls_back_all_writes(client, engine, opening):
             CREATE TRIGGER test_drop_credit BEFORE INSERT ON ledger_entries
             FOR EACH ROW EXECUTE FUNCTION test_drop_credit()
         """))
-    response = (client.post("/accounts", json={"opening_balance_cents": 5})
+    headers = {"Idempotency-Key": "rollback-opening"}
+    response = (client.post("/accounts", json={"opening_balance_cents": 5}, headers=headers)
                 if opening else pay(client, source, recipient, 5))
     assert response.status_code == 500
     assert response.json()["error"]["code"] == "internal_error"
@@ -257,7 +258,9 @@ def test_commit_failure_rolls_back_all_writes(client, engine, opening):
     with engine.begin() as connection:
         connection.execute(text("DROP TRIGGER test_drop_credit ON ledger_entries"))
     if opening:
-        assert balance(client, account(client, 5)) == 5
+        retry = client.post("/accounts", json={"opening_balance_cents": 5}, headers=headers)
+        assert retry.status_code == 201
+        assert balance(client, retry.json()["id"]) == 5
     else:
         assert pay(client, source, recipient, 5).status_code == 201
     assert_reconciled(engine)
@@ -316,4 +319,32 @@ def test_ledger_cannot_be_changed_or_extended_after_commit(client, engine):
             """), {"journal": journal, "account": unrelated, "delta": delta})
         assert exc.value.orig.sqlstate == "23505"
     assert snapshot(engine) == before
+    assert_reconciled(engine)
+
+
+def test_keyed_opening_replays_original_response(client, engine):
+    headers = {"Idempotency-Key": "opening"}
+    first = client.post("/accounts", json={"opening_balance_cents": 20}, headers=headers)
+    assert first.status_code == 201
+    source, recipient = first.json()["id"], account(client)
+    assert pay(client, source, recipient, 5, "opening").status_code == 201
+    replay = client.post("/accounts", json={"opening_balance_cents": 20}, headers=headers)
+    assert replay.status_code == 200 and replay.json() == first.json()
+    conflict = client.post("/accounts", json={"opening_balance_cents": 21}, headers=headers)
+    assert conflict.status_code == 409
+    assert conflict.json()["error"]["code"] == "idempotency_conflict"
+    assert balance(client, source) == 15
+    assert snapshot(engine)[1] == (1, 2, 4)
+    assert_reconciled(engine)
+
+
+def test_concurrent_keyed_opening_issues_once(client, engine):
+    def open_account():
+        return client.post("/accounts", json={"opening_balance_cents": 12},
+                           headers={"Idempotency-Key": "concurrent-opening"})
+
+    first, second = race_at(engine, "INSERT INTO accounts", open_account, open_account)
+    assert sorted([first.status_code, second.status_code]) == [200, 201]
+    assert first.json() == second.json()
+    assert snapshot(engine)[1] == (0, 1, 2)
     assert_reconciled(engine)

@@ -83,7 +83,7 @@ Application events are JSON lines on stderr. Payment events carry a request ID, 
 
 ## Phase 1 limits
 
-The API assumes a trusted local simulator client. It has no authentication or purchase-level authorization. Idempotency keys are global and retained indefinitely. Different keys represent separate payment requests. Account creation has no idempotency key, so a blind retry after an ambiguous response can create a second account and issue a second opening balance.
+The API assumes a trusted local simulator client. It has no authentication or purchase-level authorization. Idempotency keys are global and retained indefinitely. Different keys represent separate payment requests. Account creation accepts an optional `Idempotency-Key` in a separate namespace. A matching retry returns HTTP 200 with the original account ID and opening balance. Changing the opening amount returns HTTP 409. Unkeyed requests create a new account on each submission.
 
 The issuance row serializes funded account creation and imposes a total issuance cap of 2^63 cents. Offset-based history pagination can shift if postings arrive between page reads. The API stores balances for efficient reads and checks, so direct SQL changes outside the service can bypass balance-to-ledger reconciliation. The local migration role can also change schema protections. Treat direct database writers and the migration role as trusted.
 

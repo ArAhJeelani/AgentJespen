@@ -15,7 +15,7 @@ ERRORS = {
     "insufficient_funds": (409, "Source account has insufficient funds"),
     "balance_limit": (409, "Recipient balance would exceed the supported range"),
     "issuance_limit": (409, "Opening balance would exceed the issuance account's range"),
-    "idempotency_conflict": (409, "This idempotency key belongs to a different payment payload"),
+    "idempotency_conflict": (409, "This idempotency key belongs to a different request payload"),
 }
 
 
@@ -46,11 +46,22 @@ def post_transfer(connection: Connection, source: UUID, destination: UUID,
     return transaction_id
 
 
-def create_account(engine: Engine, amount: int, request_id: str):
+def create_account(engine: Engine, amount: int, request_id: str, key: str | None = None):
     account_id = uuid4()
     transaction_id = None
     with engine.begin() as connection:
-        connection.execute(text("INSERT INTO accounts (id) VALUES (:id)"), {"id": account_id})
+        inserted = connection.execute(text("""
+            INSERT INTO accounts (id, creation_key, opening_cents)
+            VALUES (:id, :key, :opening)
+            ON CONFLICT (creation_key) DO NOTHING RETURNING id
+        """), {"id": account_id, "key": key, "opening": amount if key is not None else None})
+        if inserted.scalar_one_or_none() is None:
+            original = connection.execute(text("""
+                SELECT id, opening_cents FROM accounts WHERE creation_key = :key
+            """), {"key": key}).one()
+            if original.opening_cents != amount:
+                raise PaymentError("idempotency_conflict")
+            return {"id": original.id, "balance_cents": original.opening_cents}, None, True
         if amount:
             issuance = connection.execute(text("""
                 SELECT balance_cents FROM accounts WHERE id = :id FOR UPDATE
@@ -58,7 +69,7 @@ def create_account(engine: Engine, amount: int, request_id: str):
             if issuance - amount < MIN_CENTS:
                 raise PaymentError("issuance_limit")
             transaction_id = post_transfer(connection, ISSUANCE_ID, account_id, amount, request_id)
-    return {"id": account_id, "balance_cents": amount}, transaction_id
+    return {"id": account_id, "balance_cents": amount}, transaction_id, False
 
 
 def get_account(connection: Connection, account_id: UUID):
