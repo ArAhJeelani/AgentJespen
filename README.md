@@ -230,3 +230,47 @@ when the execution cancels a pending model call. Thinking usage for that call
 is unavailable until the provider returns it. `provider_error` includes a safe
 diagnostic message and an HTTP error code when available. The adapter disables
 SDK retries and automatic continuation.
+
+## Phase 3 deterministic faults
+
+Faults are disabled by default. To enable them, save a JSON plan and pass
+`--fault-plan /path/to/plan.json` to the agent demo command. This example loses
+the first successful payment response and blocks the first lookup by key.
+
+```json
+{
+  "rules": [
+    {"operation": "make_payment", "invocation": 1, "fault": "post_commit_response_loss"},
+    {"operation": "lookup_payment_by_key", "invocation": 1, "fault": "status_lookup_failure"}
+  ]
+}
+```
+
+Invocations start at one and count outbound requests per operation, per
+execution. Invalid tool arguments do not issue a request. Use `count` to
+target consecutive invocations starting at the specified number. It defaults
+to one. Rules for the same operation cannot overlap. An unmatched request
+goes through normally. Repeating the same HTTP operation sequence reproduces
+the schedule. A live model can choose a different sequence.
+
+| Fault | Semantics |
+| --- | --- |
+| `pre_commit_failure` | Drops a payment request before it reaches the simulator. The agent receives an ambiguous outcome. |
+| `post_commit_response_loss` | Forwards the payment once and drops the reply only after the simulator confirms a new commit with HTTP 201 and a valid receipt. Replays and rejections pass through. |
+| `delayed_response` | Holds the buffered upstream response for `delay_ms`. The transport enforces HTTPX's configured read timeout on the simulated hold. |
+| `http_503` | Returns HTTP 503 without forwarding. Use `count` to configure the length of the outage in requests. |
+| `rate_limit` | Returns HTTP 429 without forwarding. Set `retry_after_seconds`. The tool result exposes the header as `retry_after`. The agent chooses its next action. |
+| `status_lookup_failure` | Temporarily drops `check_payment_status` or `lookup_payment_by_key` before forwarding. |
+
+The history starts with the complete `trusted_fault_plan`. Each
+`fault_activated` and `upstream_outcome` event carries the request
+correlation ID. For payment writes, the trusted outcome can be `committed`,
+`replayed`, `rejected`, `never_forwarded`, or `unknown`. Successful
+reads are marked `read_succeeded`. The model sees the `tool_result`. For example,
+a committed payment whose response is dropped looks ambiguous to the agent.
+
+The simulated delay starts after the upstream reply has been read and uses a
+separate read timeout for that hold. The runner's overall deadline still
+applies to the entire tool call. The implementation does not simulate TCP
+packet timing, and it cannot determine whether a real upstream request
+committed if no authoritative reply was received.
