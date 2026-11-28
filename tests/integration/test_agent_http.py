@@ -9,8 +9,10 @@ from uuid import UUID, uuid4
 import httpx
 import pytest
 import uvicorn
+from sqlalchemy import text
 
 from agent.config import Limits
+from agent.faults import FaultPlan, FaultRule
 from agent.history import History
 from agent.payment_client import PaymentClient
 from agent.provider import Call, Turn
@@ -138,3 +140,203 @@ def test_live_gemini(simulator, tmp_path):
     events = [json.loads(line) for line in path.read_text().splitlines()]
     assert any(event["event"] == "tool_result" and event["name"] == "make_payment"
                and event["result"].get("data", {}).get("id") == payment["id"] for event in events)
+
+
+class FaultScript:
+    configuration = {"provider": "script", "model": "fault-script-v1", "sampling": {}}
+
+    def __init__(self, *calls):
+        self.calls = iter(calls)
+        self.results = []
+
+    async def generate(self, *, results, **kwargs):
+        self.results.extend(result.payload for result in results)
+        call = next(self.calls, None)
+        if call is None:
+            return Turn(text="Finished scenario.", usage={"total_tokens": 10})
+        return Turn(calls=(call,), usage={"total_tokens": 10})
+
+
+def payment(recipient, key="once", amount=25):
+    return Call("make_payment", {
+        "recipient": str(recipient), "amount_cents": amount, "idempotency_key": key,
+    })
+
+
+def rule(fault, invocation=1, operation="make_payment", **fields):
+    return FaultRule(fault=fault, invocation=invocation, operation=operation, **fields)
+
+
+def fault_run(simulator, context, script, path, plan, *, timeout=10, seconds=5):
+    async def scenario():
+        async with PaymentClient(simulator, fault_plan=plan, timeout=timeout) as client:
+            with History(path) as history:
+                return await run(script, client, context, history, Limits(seconds=seconds))
+
+    result = asyncio.run(scenario())
+    return result, [json.loads(line) for line in path.read_text().splitlines()]
+
+
+def outcomes(events):
+    return [event for event in events if event["event"] == "upstream_outcome"]
+
+
+def assert_finances(engine, source, recipient, payment_count, *, rejected=0):
+    with engine.connect() as connection:
+        balances = dict(connection.execute(text("""
+            SELECT id, balance_cents FROM accounts WHERE id IN (:source, :recipient)
+        """), {"source": source, "recipient": recipient}).tuples().all())
+        assert balances == {source: 100 - payment_count * 25, recipient: payment_count * 25}
+        assert connection.execute(text("SELECT count(*) FROM payments")).scalar_one() == payment_count + rejected
+        postings = connection.execute(text("""
+            SELECT p.id, t.id, count(e.account_id), sum(e.delta_cents)
+            FROM payments p JOIN ledger_transactions t ON t.payment_id = p.id
+            JOIN ledger_entries e ON e.transaction_id = t.id GROUP BY p.id, t.id
+        """)).all()
+        assert len(postings) == payment_count
+        assert all(row[2:] == (2, 0) for row in postings)
+        return {str(row[0]): str(row[1]) for row in postings}
+
+
+def test_pre_commit_connection_failure_is_never_forwarded(simulator, engine, tmp_path):
+    source, recipient = prepare(simulator)
+    script = FaultScript(payment(recipient))
+    plan = FaultPlan(rules=(rule("pre_commit_failure"),))
+    result, events = fault_run(simulator, context_for(source, recipient), script,
+                               tmp_path / "pre-commit.jsonl", plan)
+    assert result["reason"] == "final_response"
+    assert script.results == [{"ok": False, "error": {"code": "ambiguous_outcome"},
+                               "request_id": outcomes(events)[0]["request_id"]}]
+    assert [item["outcome"] for item in outcomes(events)] == ["never_forwarded"]
+    assert_finances(engine, source, recipient, 0)
+
+
+@pytest.mark.parametrize("retry_key", ["once", "different"])
+def test_response_loss_then_retry(simulator, engine, tmp_path, retry_key):
+    source, recipient = prepare(simulator)
+    script = FaultScript(payment(recipient), payment(recipient, retry_key))
+    plan = FaultPlan(rules=(rule("post_commit_response_loss"),))
+    result, events = fault_run(simulator, context_for(source, recipient), script,
+                               tmp_path / "post-commit.jsonl", plan)
+    assert result["reason"] == "final_response"
+    first, second = outcomes(events)
+    same_key = retry_key == "once"
+    assert first["outcome"] == "committed" and first["http_status"] == 201
+    assert second["outcome"] == ("replayed" if same_key else "committed")
+    assert second["http_status"] == (200 if same_key else 201)
+    assert (first["payment_id"] == second["payment_id"]) == same_key
+    assert (first["ledger_transaction_id"] == second["ledger_transaction_id"]) == same_key
+    assert script.results[0] == {"ok": False, "error": {"code": "ambiguous_outcome"},
+                                 "request_id": first["request_id"]}
+    assert script.results[1]["data"]["id"] == second["payment_id"]
+    assert [entry["request_id"] for entry in events if entry["event"] == "fault_activated"] == [first["request_id"]]
+    assert events[0]["trusted_fault_plan"] == plan.model_dump(mode="json")
+    assert "trusted_fault_plan" not in repr(script.results) and "post_commit_response_loss" not in repr(script.results)
+    assert assert_finances(engine, source, recipient, 1 if same_key else 2) == {
+        entry["payment_id"]: entry["ledger_transaction_id"] for entry in (first, second)
+    }
+
+
+def test_post_commit_fault_skips_replay_and_rejected_request(simulator, engine, tmp_path):
+    source, recipient = prepare(simulator)
+    script = FaultScript(payment(recipient), payment(recipient), payment(recipient, "too-much", 101))
+    plan = FaultPlan(rules=(rule("post_commit_response_loss", invocation=2, count=2),))
+    result, events = fault_run(simulator, context_for(source, recipient), script,
+                               tmp_path / "skipped.jsonl", plan)
+    assert result["reason"] == "final_response"
+    assert [item["outcome"] for item in outcomes(events)] == ["committed", "replayed", "rejected"]
+    assert len([entry for entry in events if entry["event"] == "fault_skipped"]) == 2
+    assert script.results[1]["http_status"] == 200
+    assert script.results[2]["error"]["code"] == "insufficient_funds"
+    assert_finances(engine, source, recipient, 1, rejected=1)
+
+
+def test_delayed_reply_exceeds_client_timeout_after_commit(simulator, engine, tmp_path):
+    source, recipient = prepare(simulator)
+    script = FaultScript(payment(recipient))
+    plan = FaultPlan(rules=(rule("delayed_response", delay_ms=30000),))
+    result, events = fault_run(simulator, context_for(source, recipient), script,
+                               tmp_path / "delayed.jsonl", plan, timeout=0.5)
+    assert result["reason"] == "final_response"
+    assert script.results[0]["error"]["code"] == "ambiguous_outcome"
+    assert outcomes(events)[0]["outcome"] == "committed"
+    assert_finances(engine, source, recipient, 1)
+
+
+def test_transient_errors_rate_limit_and_lookup_recovery(simulator, engine, tmp_path):
+    source, recipient = prepare(simulator)
+    lookup = Call("lookup_payment_by_key", {"idempotency_key": "once"})
+    script = FaultScript(*(payment(recipient) for _ in range(4)), lookup, lookup)
+    plan = FaultPlan(rules=(
+        rule("http_503", count=2), rule("rate_limit", 3, retry_after_seconds=4),
+        rule("post_commit_response_loss", 4),
+        rule("status_lookup_failure", operation="lookup_payment_by_key"),
+    ))
+    result, events = fault_run(simulator, context_for(source, recipient), script,
+                               tmp_path / "transient.jsonl", plan)
+    assert result["reason"] == "final_response"
+    assert [entry.get("http_status") for entry in script.results] == [503, 503, 429, None, None, 200]
+    assert script.results[2]["retry_after"] == "4"
+    assert script.results[4]["error"]["code"] == "simulator_unreachable"
+    assert script.results[3]["error"]["code"] == "ambiguous_outcome"
+    assert script.results[5]["data"]["id"] == outcomes(events)[3]["payment_id"]
+    assert [entry["outcome"] for entry in outcomes(events)] == [
+        "never_forwarded", "never_forwarded", "never_forwarded",
+        "committed", "never_forwarded", "read_succeeded",
+    ]
+    assert_finances(engine, source, recipient, 1)
+
+
+def test_plan_schedule_resets_on_reused_client_and_is_hidden(simulator, engine, tmp_path):
+    source, recipient = prepare(simulator)
+    plan = FaultPlan(rules=(rule("http_503", count=2),))
+    provider_inputs = []
+
+    class InspectingScript(FaultScript):
+        async def generate(self, *, results, **kwargs):
+            provider_inputs.append((results, kwargs))
+            return await super().generate(results=results, **kwargs)
+
+    async def scenario():
+        for repeat_plan in (plan, None):
+            async with PaymentClient(simulator, fault_plan=repeat_plan) as client:
+                for index in range(2):
+                    path = tmp_path / f"schedule-{repeat_plan is not None}-{index}.jsonl"
+                    script = InspectingScript(*(payment(recipient) for _ in range(3)))
+                    with History(path) as history:
+                        assert (await run(script, client, context_for(source, recipient), history))[
+                            "reason"] == "final_response"
+
+    asyncio.run(scenario())
+    for index in range(2):
+        active = [json.loads(line) for line in (tmp_path / f"schedule-True-{index}.jsonl").read_text().splitlines()]
+        assert [(event["invocation"], event["fault"]) for event in active if event["event"] == "fault_activated"] == [
+            (1, "http_503"), (2, "http_503"),
+        ]
+        clean = (tmp_path / f"schedule-False-{index}.jsonl").read_text()
+        assert "trusted_fault_plan" not in clean and "fault_activated" not in clean
+    assert "trusted_fault_plan" not in repr(provider_inputs)
+    assert "http_503" not in repr(provider_inputs)
+    assert_finances(engine, source, recipient, 1)
+
+
+def test_runner_deadline_cancels_pending_delivery_after_commit(simulator, engine, tmp_path):
+    source, recipient = prepare(simulator)
+    script = FaultScript(payment(recipient))
+    plan = FaultPlan(rules=(rule("delayed_response", delay_ms=30000),))
+    path = tmp_path / "deadline.jsonl"
+
+    async def scenario():
+        async with PaymentClient(simulator, fault_plan=plan, timeout=10) as client:
+            with History(path) as history:
+                current_tasks = asyncio.all_tasks()
+                result = await run(script, client, context_for(source, recipient), history, Limits(seconds=0.5))
+                assert result["reason"] == "time_limit"
+                assert asyncio.all_tasks() == current_tasks
+
+    asyncio.run(scenario())
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert outcomes(events)[0]["outcome"] == "committed"
+    assert events[-2]["event"] == "tool_interrupted"
+    assert not script.results
+    assert_finances(engine, source, recipient, 1)
