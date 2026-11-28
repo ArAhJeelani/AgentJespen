@@ -41,14 +41,16 @@ async def run(provider: Provider, client: PaymentClient, execution: Execution,
            agent_visible={"instruction": execution.instruction, "system_prompt": prompt},
            trusted_intent=asdict(execution.intent) | {"recipient": str(execution.intent.recipient)},
            prompt_configuration=execution.configuration, prompt_version=PROMPT_VERSION,
-           model=provider.configuration, limits=asdict(limits))
+           model=provider.configuration, limits=asdict(limits),
+           **({"trusted_fault_plan": client.fault_plan.model_dump(mode="json")}
+              if client.fault_plan is not None else {}))
     model_calls = tool_calls = tokens = 0
     final = None
     reason = "model_call_limit"
     results: list[Result] = []
     tool_definitions = definitions()
     try:
-        async with asyncio.timeout(limits.seconds):
+        async with client.fault_scope(record), asyncio.timeout(limits.seconds):
             while model_calls < limits.model_calls:
                 model_calls += 1
                 max_output = min(limits.output_tokens, limits.total_tokens - tokens)
