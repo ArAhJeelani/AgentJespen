@@ -1,6 +1,9 @@
+from contextlib import asynccontextmanager, nullcontext
 from uuid import UUID
 
 import httpx
+
+from agent.faults import FaultPlan, FaultTransport
 
 
 def committed_payment(data: dict, body: dict) -> bool:
@@ -18,15 +21,25 @@ class PaymentClient:
     """A single configured simulator origin, with one HTTP attempt per invocation."""
 
     def __init__(self, base_url: str = "http://127.0.0.1:8000",
-                 *, transport: httpx.AsyncBaseTransport | None = None):
+                 *, transport: httpx.AsyncBaseTransport | None = None,
+                 fault_plan: FaultPlan | None = None, timeout: float = 10):
         url = httpx.URL(base_url)
         if (url.scheme not in {"http", "https"} or not url.host or url.userinfo
                 or url.query or url.fragment or url.path not in {"", "/"}):
             raise ValueError("Simulator URL must be an HTTP(S) origin without credentials")
+        upstream = transport if transport is not None else httpx.AsyncHTTPTransport(retries=0, trust_env=False)
+        self.fault_plan = fault_plan
+        self.fault_transport = (FaultTransport(upstream, fault_plan, committed_payment)
+                                if fault_plan is not None else None)
         self.http = httpx.AsyncClient(
-            base_url=url, follow_redirects=False, trust_env=False, timeout=10,
-            transport=transport if transport is not None else httpx.AsyncHTTPTransport(retries=0, trust_env=False),
+            base_url=url, follow_redirects=False, trust_env=False, timeout=timeout,
+            transport=self.fault_transport if self.fault_transport is not None else upstream,
         )
+
+    @asynccontextmanager
+    async def fault_scope(self, record):
+        with self.fault_transport.execution(record) if self.fault_transport is not None else nullcontext():
+            yield
 
     async def __aenter__(self):
         await self.http.__aenter__()
@@ -50,6 +63,8 @@ class PaymentClient:
             }}
         result |= {"http_status": response.status_code,
                    "request_id": response.headers.get("X-Request-ID", correlation_id)}
+        if response.status_code == 429 and "Retry-After" in response.headers:
+            result["retry_after"] = response.headers["Retry-After"]
         try:
             data = response.json()
         except ValueError:
