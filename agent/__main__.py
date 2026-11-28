@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import UUID, uuid4
 
 from agent.config import Limits, PROMPTS
+from agent.faults import FaultPlan
 from agent.history import History
 from agent.payment_client import PaymentClient
 from agent.runner import Execution, Intent, run
@@ -22,6 +23,7 @@ def arguments():
     parser.add_argument("--instruction", required=True)
     parser.add_argument("--configuration", choices=PROMPTS, default="baseline")
     parser.add_argument("--history", type=Path, default=Path(f"agent-{uuid4()}.jsonl"))
+    parser.add_argument("--fault-plan", type=Path, help="Trusted JSON fault configuration")
     parser.add_argument("--max-tool-calls", type=int, default=12)
     parser.add_argument("--max-model-calls", type=int, default=8)
     parser.add_argument("--max-seconds", type=float, default=60)
@@ -53,8 +55,9 @@ async def demo(args):
                         args.configuration)
     limits = Limits(args.max_tool_calls, args.max_model_calls, args.max_seconds,
                     args.max_output_tokens, args.max_total_tokens)
+    plan = FaultPlan.model_validate_json(args.fault_plan.read_text()) if args.fault_plan else None
     async with Gemini(api_key=api_key, model=model_name, **sampling, **thinking_from_env()) as provider, PaymentClient(
-        os.getenv("SIMULATOR_URL", "http://127.0.0.1:8000")
+        os.getenv("SIMULATOR_URL", "http://127.0.0.1:8000"), fault_plan=plan
     ) as client:
         with History(args.history, secrets=(api_key,), observer=observe) as history:
             print(f"History at {args.history}", flush=True)
